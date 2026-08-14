@@ -10,6 +10,32 @@ A superproject tag is the release version for the complete pair. Release tags
 are created only here and are applied unchanged to every published image. The
 release workflow never publishes `latest`.
 
+## Current audited state
+
+Audit date: 2026-08-14.
+
+At audit time, superproject commit `032721b` pinned and validated this supported
+pair (documentation-only commits do not change the gitlinks):
+
+| Component | Pinned commit |
+| --- | --- |
+| Platform | `e73a5d806000722e3b3abe7ee25c7075b4007687` |
+| Gateway | `777278ea8b38491a19f585b3c026f28da7726c0f` |
+
+`scripts/validate-pair.sh` and pair-manifest generation pass for these pins. The
+canonical and vendored Cap'n Proto files are byte-identical, and the manifest
+contains 66 migration records (the Orleans schema plus 65 product migrations).
+
+The independently audited component branch heads, Platform `30d82d0` and Gateway
+`98c62fd`, are newer than this supported pair. They are implementation candidates,
+not a compatibility promise, until both gitlinks are advanced in one reviewed
+superproject commit and the complete paired CI passes. A dirty component worktree
+is never an eligible pin.
+
+ScalaAPI is a greenfield product. The Sub2API repository is research input only;
+this version authority does not provide a Sub2API migration path, schema/data
+compatibility, API emulation or dual-run contract.
+
 ## Check out and validate a pair
 
 ```bash
@@ -25,9 +51,8 @@ difference between Platform's canonical Cap'n Proto schemas and Gateway's
 vendored copies. `generate-pair-manifest.sh` runs the same validation before it
 writes JSON; it does not record test results or claim that skipped work passed.
 
-The current pins are known to contain contract drift, so validation is expected
-to fail until a compatible component pair is selected. This is intentional: a
-red compatibility gate must not be converted into a warning or bypassed in CI.
+Any validation failure is a release blocker. It must not be converted into a
+warning or bypassed in CI.
 
 Local prerequisites are Bash, Git, GNU `sha256sum`, `cmp`, and `jq`. The GitHub
 Actions workflows install the build-specific .NET, Node, C++, CMake, and
