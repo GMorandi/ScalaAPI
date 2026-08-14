@@ -1,6 +1,6 @@
-[submodule "ScalaAPI-Platform"]
-	path = ScalaAPI-Platform
+[submodule "platform"]
+	path = platform
 	url = https://github.com/GMorandi/ScalaAPI-Platform.git
-[submodule "ScalaAPI-GateWay"]
-	path = ScalaAPI-GateWay
+[submodule "gateway"]
+	path = gateway
 	url = https://github.com/GMorandi/ScalaAPI-GateWay.git

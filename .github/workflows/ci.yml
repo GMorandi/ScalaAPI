@@ -1,0 +1,240 @@
+name: ScalaAPI Paired CI
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scalaapi-pair-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pair-gate:
+    name: Immutable pair and contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the pinned pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Validate gitlinks and contracts
+        run: scripts/validate-pair.sh
+
+  gateway:
+    name: Gateway build, test, and benchmark smoke
+    needs: pair-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the pinned pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libaio-dev libssl-dev libsqlite3-dev zlib1g-dev
+
+      - name: Configure Gateway
+        run: >-
+          cmake -S gateway -B gateway/build
+          -DCMAKE_BUILD_TYPE=Release
+          -DGATEWAY_BUILD_TESTS=ON
+          -DGATEWAY_BUILD_BENCHMARKS=ON
+
+      - name: Build Gateway
+        run: cmake --build gateway/build --parallel "$(nproc)"
+
+      - name: Run Gateway tests
+        run: ctest --test-dir gateway/build --output-on-failure
+
+      - name: Run Gateway benchmark smoke
+        run: gateway/build/test/benchmarks --benchmark_min_time=0.1s
+
+  platform:
+    name: Platform greenfield, tests, and benchmark smoke
+    needs: pair-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: platform
+          POSTGRES_USER: platform
+          POSTGRES_PASSWORD: ci-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U platform -d platform"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ConnectionStrings__Postgres: Host=localhost;Port=5432;Database=platform;Username=platform;Password=ci-password
+      GREENFIELD_SCHEMA_CONNECTION: Host=localhost;Port=5432;Database=platform;Username=platform;Password=ci-password
+    steps:
+      - name: Check out the pinned pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build the pinned Cap'n Proto compiler
+        run: |
+          git clone --depth 1 --branch v1.0.2 https://github.com/capnproto/capnproto.git "$RUNNER_TEMP/capnproto"
+          test "$(git -C "$RUNNER_TEMP/capnproto" rev-parse HEAD)" = "1a0e12c0a3ba1f0dbbad45ddfef555166e0a14fc"
+          cmake -S "$RUNNER_TEMP/capnproto" -B "$RUNNER_TEMP/capnproto-build" -DBUILD_TESTING=OFF
+          cmake --build "$RUNNER_TEMP/capnproto-build" --target capnp_tool --parallel 2
+          echo "CAPNP_COMPILER=$RUNNER_TEMP/capnproto-build/c++/src/capnp/capnp" >> "$GITHUB_ENV"
+
+      - name: Verify generated contracts and retired dependencies
+        working-directory: platform
+        run: |
+          scripts/verify-generated-contracts.sh
+          scripts/verify-retired-dependencies.sh
+
+      - name: Restore Platform
+        run: dotnet restore platform/ScalaAPI.Platform.slnx
+
+      - name: Scan restored packages for high-severity vulnerabilities
+        run: |
+          set -o pipefail
+          dotnet list platform/ScalaAPI.Platform.slnx package --vulnerable --include-transitive 2>&1 |
+            tee "$RUNNER_TEMP/platform-vulnerabilities.txt"
+          if grep -Eiq 'critical|high' "$RUNNER_TEMP/platform-vulnerabilities.txt"; then
+            echo "Critical or high severity package vulnerability found" >&2
+            exit 1
+          fi
+
+      - name: Build Platform
+        run: dotnet build platform/ScalaAPI.Platform.slnx --no-restore -c Release
+
+      - name: Validate migration inputs
+        run: |
+          set -euo pipefail
+          mapfile -t migration_files < <(
+            find platform/deploy/migrations -maxdepth 1 -type f -name '*.sql' -print | sort
+          )
+          (( ${#migration_files[@]} > 0 ))
+          for migration_file in "${migration_files[@]}"; do
+            test -s "$migration_file"
+          done
+
+      - name: Apply the greenfield schema twice
+        run: |
+          set -euo pipefail
+          migration_dir="$RUNNER_TEMP/migrations"
+          mkdir -p "$migration_dir"
+          cp platform/deploy/orleans-postgres-schema.sql "$migration_dir/000-orleans.sql"
+          cp platform/deploy/migrations/*.sql "$migration_dir/"
+          dotnet run --project platform/src/Db.Migrator/Db.Migrator.csproj --no-build -c Release -- "$migration_dir"
+          dotnet run --project platform/src/Db.Migrator/Db.Migrator.csproj --no-build -c Release -- "$migration_dir"
+
+      - name: Verify the resulting schema
+        run: >-
+          dotnet test platform/test/Host.Tests/Host.Tests.csproj
+          --no-build -c Release
+          --filter FullyQualifiedName~MigrationSchemaTests
+          --verbosity normal
+
+      - name: Run all Platform tests
+        run: >-
+          dotnet test platform/ScalaAPI.Platform.slnx --no-build -c Release
+          --verbosity normal --logger "trx;LogFileName=platform.trx"
+
+      - name: Upload Platform test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scalaapi-platform-test-results-${{ github.sha }}
+          path: platform/test/**/TestResults/*.trx
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Run Platform benchmark smoke
+        run: >-
+          dotnet run
+          --project platform/test/Platform.Benchmarks/Platform.Benchmarks.csproj
+          --no-build -c Release --
+          --job Dry --filter '*Scheduler*'
+
+  web:
+    name: ${{ matrix.application }} typecheck and build
+    needs: pair-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        application: [admin-web, user-web]
+    steps:
+      - name: Check out the pinned pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: platform/${{ matrix.application }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: platform/${{ matrix.application }}
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: platform/${{ matrix.application }}
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: platform/${{ matrix.application }}
+        run: npm run build
+
+  pair-manifest:
+    name: Publish validated pair manifest
+    needs: [pair-gate, gateway, platform, web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the pinned pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Generate pair manifest
+        run: scripts/generate-pair-manifest.sh "$RUNNER_TEMP/pair-manifest.json"
+
+      - name: Upload pair manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: scalaapi-pair-manifest-${{ github.sha }}
+          path: ${{ runner.temp }}/pair-manifest.json
+          if-no-files-found: error
+          retention-days: 30

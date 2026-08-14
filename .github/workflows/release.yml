@@ -1,0 +1,255 @@
+name: ScalaAPI Paired Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: scalaapi-paired-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality-gates:
+    name: Complete paired CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release-metadata:
+    name: Validate release identity
+    needs: quality-gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      superproject_sha: ${{ steps.metadata.outputs.superproject_sha }}
+      platform_sha: ${{ steps.metadata.outputs.platform_sha }}
+      gateway_sha: ${{ steps.metadata.outputs.gateway_sha }}
+      contract_digest: ${{ steps.metadata.outputs.contract_digest }}
+      migration_digest: ${{ steps.metadata.outputs.migration_digest }}
+    steps:
+      - name: Check out the release pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Validate the superproject release tag
+        run: scripts/validate-release-tag.sh "$GITHUB_REF_NAME"
+
+      - name: Generate release pair manifest
+        run: scripts/generate-pair-manifest.sh "$RUNNER_TEMP/pair-manifest.json"
+
+      - name: Export immutable metadata
+        id: metadata
+        run: |
+          {
+            echo "superproject_sha=$(jq -r '.superproject.commit' "$RUNNER_TEMP/pair-manifest.json")"
+            echo "platform_sha=$(jq -r '.components.platform.commit' "$RUNNER_TEMP/pair-manifest.json")"
+            echo "gateway_sha=$(jq -r '.components.gateway.commit' "$RUNNER_TEMP/pair-manifest.json")"
+            echo "contract_digest=$(jq -r '.contract.digest' "$RUNNER_TEMP/pair-manifest.json")"
+            echo "migration_digest=$(jq -r '.migrations.digest' "$RUNNER_TEMP/pair-manifest.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload release pair manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: scalaapi-release-pair-${{ github.ref_name }}
+          path: ${{ runner.temp }}/pair-manifest.json
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-images:
+    name: Publish ${{ matrix.key }}
+    needs: release-metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: gateway
+            component: gateway
+            repository: ghcr.io/gmorandi/scalaapi-gateway
+            context: ./gateway
+            dockerfile: ./gateway/Dockerfile
+            target: runtime
+          - key: platform
+            component: platform
+            repository: ghcr.io/gmorandi/scalaapi-platform
+            context: ./platform
+            dockerfile: ./platform/Dockerfile
+            target: platform-silo
+          - key: admin-api
+            component: platform
+            repository: ghcr.io/gmorandi/scalaapi-admin-api
+            context: ./platform
+            dockerfile: ./platform/Dockerfile
+            target: admin-api
+          - key: migrator
+            component: platform
+            repository: ghcr.io/gmorandi/scalaapi-migrator
+            context: ./platform
+            dockerfile: ./platform/Dockerfile
+            target: migrate
+          - key: provider-mock
+            component: platform
+            repository: ghcr.io/gmorandi/scalaapi-provider-mock
+            context: ./platform
+            dockerfile: ./platform/Dockerfile
+            target: provider-mock
+    steps:
+      - name: Check out the release pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Select component commit
+        id: component
+        env:
+          COMPONENT: ${{ matrix.component }}
+          PLATFORM_SHA: ${{ needs.release-metadata.outputs.platform_sha }}
+          GATEWAY_SHA: ${{ needs.release-metadata.outputs.gateway_sha }}
+        run: |
+          set -euo pipefail
+          case "$COMPONENT" in
+            platform) component_sha="$PLATFORM_SHA" ;;
+            gateway) component_sha="$GATEWAY_SHA" ;;
+            *) echo "unknown component: $COMPONENT" >&2; exit 1 ;;
+          esac
+          echo "sha=$component_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push tagged image
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          push: true
+          tags: ${{ matrix.repository }}:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.release-metadata.outputs.superproject_sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            io.scalaapi.component=${{ matrix.component }}
+            io.scalaapi.component.revision=${{ steps.component.outputs.sha }}
+            io.scalaapi.platform.revision=${{ needs.release-metadata.outputs.platform_sha }}
+            io.scalaapi.gateway.revision=${{ needs.release-metadata.outputs.gateway_sha }}
+            io.scalaapi.contract.digest=sha256:${{ needs.release-metadata.outputs.contract_digest }}
+            io.scalaapi.migrations.digest=sha256:${{ needs.release-metadata.outputs.migration_digest }}
+
+      - name: Record registry image metadata
+        env:
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+          IMAGE_TAG: ${{ github.ref_name }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          COMPONENT: ${{ matrix.component }}
+          COMPONENT_COMMIT: ${{ steps.component.outputs.sha }}
+          SUPERPROJECT_COMMIT: ${{ needs.release-metadata.outputs.superproject_sha }}
+          CONTRACT_DIGEST: ${{ needs.release-metadata.outputs.contract_digest }}
+          MIGRATION_DIGEST: ${{ needs.release-metadata.outputs.migration_digest }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/image-metadata"
+          jq -n \
+            --arg repository "$IMAGE_REPOSITORY" \
+            --arg tag "$IMAGE_TAG" \
+            --arg reference "$IMAGE_REPOSITORY:$IMAGE_TAG" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg component "$COMPONENT" \
+            --arg component_commit "$COMPONENT_COMMIT" \
+            --arg superproject_commit "$SUPERPROJECT_COMMIT" \
+            --arg contract_digest "$CONTRACT_DIGEST" \
+            --arg migration_digest "$MIGRATION_DIGEST" \
+            --arg dockerfile "$DOCKERFILE" \
+            --arg target "$TARGET" \
+            '{
+              repository: $repository,
+              tag: $tag,
+              reference: $reference,
+              digest: $digest,
+              component: $component,
+              component_commit: $component_commit,
+              superproject_commit: $superproject_commit,
+              contract_digest: $contract_digest,
+              migration_digest: $migration_digest,
+              build: {dockerfile: $dockerfile, target: $target}
+            }' > "$RUNNER_TEMP/image-metadata/${{ matrix.key }}.json"
+
+      - name: Upload image metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: scalaapi-release-image-${{ matrix.key }}-${{ github.ref_name }}
+          path: ${{ runner.temp }}/image-metadata/${{ matrix.key }}.json
+          if-no-files-found: error
+          retention-days: 90
+
+  release-evidence:
+    name: Assemble release evidence
+    needs: [release-metadata, publish-images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the release pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Recreate the validated pair manifest
+        run: |
+          scripts/validate-release-tag.sh "$GITHUB_REF_NAME"
+          scripts/generate-pair-manifest.sh "$RUNNER_TEMP/pair-manifest.json"
+
+      - name: Download registry image metadata
+        uses: actions/download-artifact@v4
+        with:
+          pattern: scalaapi-release-image-*-${{ github.ref_name }}
+          path: ${{ runner.temp }}/image-metadata
+          merge-multiple: true
+
+      - name: Generate release evidence
+        run: >-
+          scripts/generate-release-evidence.sh
+          --version "$GITHUB_REF_NAME"
+          --pair-manifest "$RUNNER_TEMP/pair-manifest.json"
+          --images-dir "$RUNNER_TEMP/image-metadata"
+          --output "$RUNNER_TEMP/release-evidence.json"
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: scalaapi-release-evidence-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/release-evidence.json
+            ${{ runner.temp }}/pair-manifest.json
+          if-no-files-found: error
+          retention-days: 90
