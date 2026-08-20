@@ -278,7 +278,7 @@ jobs:
           scripts/generate-pair-manifest.sh "$RUNNER_TEMP/pair-manifest.json"
 
       - name: Download registry image metadata
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: scalaapi-release-images-${{ github.ref_name }}
           path: ${{ runner.temp }}/image-metadata
