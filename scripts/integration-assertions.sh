@@ -213,4 +213,25 @@ assert_equals "1|1|0|1|1|0|1|1|1|1" "$settlement_state" \
     fail "settlement invariants violated (leases|completed|reconciliation_needed|holds|committed|active|usage_events|usage_logs|ledger|idempotency)"
 echo "PASS: one completed lease, committed hold, usage event, ledger entry, and idempotency record"
 
+# --- Dual-process leadership ---
+echo "Checking dual-process leadership..."
+
+silo1_healthy=$(docker inspect --format='{{.State.Health.Status}}' \
+    "$(docker compose ps -q platform-silo 2>/dev/null)" 2>/dev/null || echo "missing")
+silo2_healthy=$(docker inspect --format='{{.State.Health.Status}}' \
+    "$(docker compose ps -q platform-silo-2 2>/dev/null)" 2>/dev/null || echo "missing")
+assert_equals "healthy" "$silo1_healthy" "platform-silo health" ||
+    fail "platform-silo is not healthy: $silo1_healthy"
+assert_equals "healthy" "$silo2_healthy" "platform-silo-2 health" ||
+    fail "platform-silo-2 is not healthy: $silo2_healthy"
+echo "PASS: both silo containers are healthy"
+
+active_claims=$(docker compose exec -T postgres psql -U scalaapi -d scalaapi -tAc \
+    "SELECT count(*) FROM backup_schedule_claims WHERE expires_at > now();")
+if [ "$active_claims" -le 1 ] 2>/dev/null; then
+    echo "PASS: at most one active backup schedule claim ($active_claims)"
+else
+    fail "expected at most 1 active backup schedule claim, got $active_claims"
+fi
+
 echo "integration assertions passed"
