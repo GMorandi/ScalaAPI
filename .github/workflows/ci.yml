@@ -352,7 +352,10 @@ jobs:
               exit 1
               ;;
             migrator)
-              output="$(docker run --rm scalaapi-migrator:ci 2>&1 || true)"
+              # The image entrypoint already passes /app/migrations, so run
+              # the assembly bare to reach its argument validation.
+              output="$(docker run --rm --entrypoint dotnet scalaapi-migrator:ci \
+                migrate/Db.Migrator.dll 2>&1 || true)"
               grep -q "Usage: Db.Migrator" <<<"$output" || {
                 echo "migrator entrypoint did not reach its argument check" >&2
                 exit 1
