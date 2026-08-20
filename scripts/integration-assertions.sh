@@ -216,19 +216,22 @@ echo "PASS: one completed lease, committed hold, usage event, ledger entry, and 
 # --- Dual-process leadership ---
 echo "Checking dual-process leadership..."
 
-silo1_healthy=$(docker inspect --format='{{.State.Health.Status}}' \
-    "$(docker compose ps -q platform-silo 2>/dev/null)" 2>/dev/null || echo "missing")
-silo2_healthy=$(docker inspect --format='{{.State.Health.Status}}' \
-    "$(docker compose ps -q platform-silo-2 2>/dev/null)" 2>/dev/null || echo "missing")
-assert_equals "healthy" "$silo1_healthy" "platform-silo health" ||
-    fail "platform-silo is not healthy: $silo1_healthy"
+silo1_id="$(compose ps -q platform-silo-1)"
+[[ -n "$silo1_id" ]] || fail "platform-silo-1 container not found"
+silo1_healthy="$(docker inspect --format='{{.State.Health.Status}}' "$silo1_id")"
+assert_equals "healthy" "$silo1_healthy" "platform-silo-1 health" ||
+    fail "platform-silo-1 is not healthy: $silo1_healthy"
+
+silo2_id="$(compose ps -q platform-silo-2)"
+[[ -n "$silo2_id" ]] || fail "platform-silo-2 container not found"
+silo2_healthy="$(docker inspect --format='{{.State.Health.Status}}' "$silo2_id")"
 assert_equals "healthy" "$silo2_healthy" "platform-silo-2 health" ||
     fail "platform-silo-2 is not healthy: $silo2_healthy"
 echo "PASS: both silo containers are healthy"
 
-active_claims=$(docker compose exec -T postgres psql -U scalaapi -d scalaapi -tAc \
-    "SELECT count(*) FROM backup_schedule_claims WHERE expires_at > now();")
-if [ "$active_claims" -le 1 ] 2>/dev/null; then
+active_claims="$(db_query "SELECT count(*) FROM backup_schedule_claims WHERE expires_at > now();")"
+[[ "$active_claims" =~ ^[0-9]+$ ]] || fail "unable to read backup schedule claim count"
+if (( active_claims <= 1 )); then
     echo "PASS: at most one active backup schedule claim ($active_claims)"
 else
     fail "expected at most 1 active backup schedule claim, got $active_claims"
