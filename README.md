@@ -82,9 +82,12 @@ PostgreSQL dependencies.
 
 4. Commit the two pins together and open a pull request. The paired CI builds and
    tests Gateway, runs Platform against an empty PostgreSQL 17 database twice,
-   runs all Platform tests and benchmark smoke checks, and typechecks/builds both
-   web applications. A machine-readable pair manifest is uploaded only after all
-   jobs pass.
+   runs all Platform tests and benchmark smoke checks, typechecks, builds, and
+   runs the Playwright e2e suites of both web applications, builds and
+   vulnerability-scans all five release images, and drives one billable chat
+   request through a full docker compose stack (Gateway, Platform, admin API,
+   Provider mock) with settlement assertions and the live User Web spec. A
+   machine-readable pair manifest is uploaded only after all jobs pass.
 5. After the paired commit is merged, create a SemVer tag on that superproject
    commit and push it:
 
@@ -94,7 +97,9 @@ PostgreSQL dependencies.
    ```
 
 The tag workflow reuses the complete paired CI before registry login or image
-push. It publishes Gateway plus the four Platform runtime images under the exact
-superproject tag, then emits release evidence containing all three commits, the
-contract digest, the complete migration manifest, and registry-reported image
-digests.
+push. It refuses to publish a tag that already exists in the registry, builds
+all five images without pushing first, and pushes them only after every build
+succeeded. It publishes Gateway plus the four Platform runtime images under the
+exact superproject tag, then emits release evidence containing all three
+commits, the contract digest, the complete migration manifest, the per-gate CI
+conclusions of the producing run, and registry-reported image digests.

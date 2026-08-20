@@ -7,12 +7,24 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  schedule:
+    # Weekly drift sentinel: floating inputs (apt packages, .NET patch releases,
+    # runner image updates) surface here instead of on the next release day.
+    - cron: "0 3 * * 1"
 
 permissions:
   contents: read
 
+env:
+  DOTNET_VERSION: 10.0.x
+  NODE_VERSION: "22"
+  CAPNP_REF: v1.0.2
+  CAPNP_SHA: 1a0e12c0a3ba1f0dbbad45ddfef555166e0a14fc
+
 concurrency:
-  group: scalaapi-pair-ci-${{ github.repository }}-${{ github.ref }}
+  # The event name keeps scheduled sentinel runs from cancelling in-flight
+  # push or pull-request validation of the same ref.
+  group: scalaapi-pair-ci-${{ github.repository }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -63,7 +75,19 @@ jobs:
         run: ctest --test-dir gateway/build --output-on-failure
 
       - name: Run Gateway benchmark smoke
-        run: gateway/build/test/benchmarks --benchmark_min_time=0.1s
+        run: >-
+          gateway/build/test/benchmarks --benchmark_min_time=0.1s
+          --benchmark_format=json
+          --benchmark_out="$RUNNER_TEMP/gateway-benchmark.json"
+
+      - name: Upload Gateway benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scalaapi-gateway-benchmark-${{ github.sha }}
+          path: ${{ runner.temp }}/gateway-benchmark.json
+          if-no-files-found: warn
+          retention-days: 30
 
   platform:
     name: Platform greenfield, tests, and benchmark smoke
@@ -72,7 +96,9 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:17-alpine
+        # Digest-pinned to match the platform component's deploy/stack compose
+        # file; keep both in sync when the PostgreSQL 17 patch line moves.
+        image: docker.io/library/postgres:17-alpine@sha256:af194ccf3e2d7fe367012c7b88ce8b816c5c889b18a5b316799a1f0d7eac746a
         env:
           POSTGRES_DB: platform
           POSTGRES_USER: platform
@@ -98,12 +124,12 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: ${{ env.DOTNET_VERSION }}
 
       - name: Build the pinned Cap'n Proto compiler
         run: |
-          git clone --depth 1 --branch v1.0.2 https://github.com/capnproto/capnproto.git "$RUNNER_TEMP/capnproto"
-          test "$(git -C "$RUNNER_TEMP/capnproto" rev-parse HEAD)" = "1a0e12c0a3ba1f0dbbad45ddfef555166e0a14fc"
+          git clone --depth 1 --branch "$CAPNP_REF" https://github.com/capnproto/capnproto.git "$RUNNER_TEMP/capnproto"
+          test "$(git -C "$RUNNER_TEMP/capnproto" rev-parse HEAD)" = "$CAPNP_SHA"
           cmake -S "$RUNNER_TEMP/capnproto" -B "$RUNNER_TEMP/capnproto-build" -DBUILD_TESTING=OFF
           cmake --build "$RUNNER_TEMP/capnproto-build" --target capnp_tool --parallel 2
           echo "CAPNP_COMPILER=$RUNNER_TEMP/capnproto-build/c++/src/capnp/capnp" >> "$GITHUB_ENV"
@@ -177,13 +203,23 @@ jobs:
           dotnet run
           --project platform/test/Platform.Benchmarks/Platform.Benchmarks.csproj
           --no-build -c Release --
-          --job Dry --filter '*Scheduler*'
+          --job Short --filter '*Scheduler*'
+          --exporters json --artifacts "$RUNNER_TEMP/platform-benchmarks"
+
+      - name: Upload Platform benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scalaapi-platform-benchmark-${{ github.sha }}
+          path: ${{ runner.temp }}/platform-benchmarks/**
+          if-no-files-found: warn
+          retention-days: 30
 
   web:
-    name: ${{ matrix.application }} typecheck and build
+    name: ${{ matrix.application }} typecheck, build, and e2e
     needs: pair-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -199,7 +235,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: platform/${{ matrix.application }}/package-lock.json
 
@@ -215,9 +251,212 @@ jobs:
         working-directory: platform/${{ matrix.application }}
         run: npm run build
 
+      - name: Install Playwright browser
+        working-directory: platform/${{ matrix.application }}
+        run: npx playwright install --with-deps chromium
+
+      - name: E2E tests
+        working-directory: platform/${{ matrix.application }}
+        run: npm run test:e2e
+
+      - name: Upload Playwright results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scalaapi-${{ matrix.application }}-playwright-${{ github.sha }}
+          path: platform/${{ matrix.application }}/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  image-build:
+    name: Build and scan ${{ matrix.key }} image
+    needs: pair-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: gateway
+            component: gateway
+            context: ./gateway
+            dockerfile: ./gateway/Dockerfile
+            target: runtime
+          - key: platform
+            component: platform
+            context: ./platform
+            dockerfile: ./platform/Dockerfile
+            target: platform-silo
+          - key: admin-api
+            component: platform
+            context: ./platform
+            dockerfile: ./platform/Dockerfile
+            target: admin-api
+          - key: migrator
+            component: platform
+            context: ./platform
+            dockerfile: ./platform/Dockerfile
+            target: migrate
+          - key: provider-mock
+            component: platform
+            context: ./platform
+            dockerfile: ./platform/Dockerfile
+            target: provider-mock
+    steps:
+      - name: Check out the pinned pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the release image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          push: false
+          load: true
+          tags: scalaapi-${{ matrix.key }}:ci
+          cache-from: type=gha,scope=scalaapi-${{ matrix.key }}
+          cache-to: type=gha,mode=max,scope=scalaapi-${{ matrix.key }}
+
+      - name: Scan the image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: scalaapi-${{ matrix.key }}:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+          format: table
+
+      - name: Smoke the image
+        run: |
+          set -euo pipefail
+          case "${{ matrix.key }}" in
+            provider-mock)
+              container_id="$(docker run -d -p 18081:8081 scalaapi-provider-mock:ci)"
+              trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+              for attempt in $(seq 1 30); do
+                if curl -fsS http://127.0.0.1:18081/health >/dev/null 2>&1; then
+                  echo "provider-mock /health reachable"
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "provider-mock /health did not become reachable" >&2
+              exit 1
+              ;;
+            migrator)
+              output="$(docker run --rm scalaapi-migrator:ci 2>&1 || true)"
+              grep -q "Usage: Db.Migrator" <<<"$output" || {
+                echo "migrator entrypoint did not reach its argument check" >&2
+                exit 1
+              }
+              echo "migrator entrypoint executes and validates arguments"
+              ;;
+            platform)
+              docker run --rm --entrypoint sh scalaapi-platform:ci \
+                -c 'test -f platform/ScalaAPI.Platform.Host.dll'
+              echo "platform-silo image contains the host assembly"
+              ;;
+            admin-api)
+              docker run --rm --entrypoint sh scalaapi-admin-api:ci \
+                -c 'test -f admin/Admin.Api.dll'
+              echo "admin-api image contains the API assembly"
+              ;;
+            gateway)
+              docker run --rm --entrypoint sh scalaapi-gateway:ci \
+                -c 'test -x /usr/local/bin/gateway'
+              echo "gateway image contains the runtime binary"
+              ;;
+          esac
+
+  integration:
+    name: Full stack integration and live UI
+    needs: [pair-gate, image-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      INTEGRATION_COMPOSE_FILE: .github/integration/docker-compose.integration.yml
+      INTEGRATION_PROJECT_NAME: scalaapi-integration-${{ github.run_id }}
+    steps:
+      - name: Check out the pinned pair
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Generate the integration environment
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            echo "POSTGRES_DB=platform"
+            echo "POSTGRES_USER=platform"
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)"
+            echo "GARNET_PASSWORD=$(openssl rand -hex 16)"
+            echo "SECURITY_MASTER_KEY=$(openssl rand -base64 32)"
+            echo "JWT_KEY=$(openssl rand -hex 24)"
+            echo "ADMIN_USERNAME=admin@scalaapi.test"
+            echo "ADMIN_PASSWORD=$(openssl rand -hex 12)"
+            echo "OBJECT_STORAGE_SECRET_KEY=$(openssl rand -hex 16)"
+            echo "INTERNAL_RECONCILIATION_TOKEN=$(openssl rand -hex 16)"
+            echo "GATEWAY_PORT=18080"
+            echo "USER_WEB_PORT=13001"
+          } > "$RUNNER_TEMP/integration.env"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start the paired stack
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          docker compose \
+            --project-name "$INTEGRATION_PROJECT_NAME" \
+            --env-file "$RUNNER_TEMP/integration.env" \
+            --file "$INTEGRATION_COMPOSE_FILE" \
+            up --detach --build
+
+      - name: Run cross-component assertions
+        env:
+          INTEGRATION_ENV_FILE: ${{ runner.temp }}/integration.env
+        run: |
+          set -euo pipefail
+          set -a
+          . "$INTEGRATION_ENV_FILE"
+          set +a
+          scripts/integration-assertions.sh
+
+      - name: Run the live User Web spec
+        env:
+          PUBLIC_UI_BASE_URL: http://127.0.0.1:13001
+        working-directory: platform/user-web
+        run: |
+          set -euo pipefail
+          npm ci
+          npx playwright install chromium
+          npm run test:e2e -- tests/public-pages.live.spec.ts
+
+      - name: Tear down the integration stack
+        if: always()
+        run: |
+          docker compose \
+            --project-name "$INTEGRATION_PROJECT_NAME" \
+            --env-file "$RUNNER_TEMP/integration.env" \
+            --file "$INTEGRATION_COMPOSE_FILE" \
+            down --volumes --remove-orphans || true
+
   pair-manifest:
     name: Publish validated pair manifest
-    needs: [pair-gate, gateway, platform, web]
+    needs: [pair-gate, gateway, platform, web, image-build, integration]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

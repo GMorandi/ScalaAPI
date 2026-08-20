@@ -6,7 +6,8 @@ usage() {
     cat <<'EOF'
 Usage: scripts/generate-release-evidence.sh \
   --version vX.Y.Z --pair-manifest pair.json \
-  --images-dir image-metadata --output release-evidence.json
+  --images-dir image-metadata --gates-json gates.json \
+  --output release-evidence.json
 EOF
 }
 
@@ -18,15 +19,17 @@ fail() {
 version=""
 pair_manifest=""
 images_dir=""
+gates_json=""
 output_path=""
 while (( $# > 0 )); do
     case "$1" in
-        --version|--pair-manifest|--images-dir|--output)
+        --version|--pair-manifest|--images-dir|--gates-json|--output)
             (( $# >= 2 )) || fail "missing value for $1"
             case "$1" in
                 --version) version="$2" ;;
                 --pair-manifest) pair_manifest="$2" ;;
                 --images-dir) images_dir="$2" ;;
+                --gates-json) gates_json="$2" ;;
                 --output) output_path="$2" ;;
             esac
             shift 2
@@ -42,7 +45,7 @@ while (( $# > 0 )); do
     esac
 done
 
-[[ -n "$version" && -n "$pair_manifest" && -n "$images_dir" && -n "$output_path" ]] || {
+[[ -n "$version" && -n "$pair_manifest" && -n "$images_dir" && -n "$gates_json" && -n "$output_path" ]] || {
     usage >&2
     exit 2
 }
@@ -50,8 +53,18 @@ done
     fail "version is not a supported SemVer release: $version"
 [[ -f "$pair_manifest" ]] || fail "pair manifest not found: $pair_manifest"
 [[ -d "$images_dir" ]] || fail "image metadata directory not found: $images_dir"
+[[ -f "$gates_json" ]] || fail "gate results not found: $gates_json"
 command -v jq >/dev/null 2>&1 || fail "required command not found: jq"
 command -v sha256sum >/dev/null 2>&1 || fail "required command not found: sha256sum"
+
+jq -e '
+    .status == "passed" and
+    (.run_id | test("^[0-9]+$")) and
+    (.run_attempt | test("^[0-9]+$")) and
+    (.gates | type == "array" and length > 0) and
+    (all(.gates[]; .conclusion == "success"))
+' "$gates_json" >/dev/null ||
+    fail "gate results do not demonstrate a fully green paired CI: $gates_json"
 
 jq -e '
     .manifest_version == 1 and
@@ -126,6 +139,7 @@ jq -n \
     --arg workflow_run_id "${GITHUB_RUN_ID:-unknown}" \
     --arg workflow_run_attempt "${GITHUB_RUN_ATTEMPT:-unknown}" \
     --slurpfile pair "$pair_manifest" \
+    --slurpfile gates "$gates_json" \
     --slurpfile images "$images_array_file" '
     {
         evidence_version: 1,
@@ -139,16 +153,11 @@ jq -n \
         contract: $pair[0].contract,
         migration_manifest: $pair[0].migrations,
         verification: {
-            status: "passed",
-            skipped: [],
-            gates: [
-                "immutable-pair-and-contract",
-                "gateway-build-test-and-benchmark",
-                "platform-generated-contract-migration-test-and-benchmark",
-                "platform-vulnerability-scan",
-                "admin-web-typecheck-and-build",
-                "user-web-typecheck-and-build"
-            ]
+            status: $gates[0].status,
+            run_id: $gates[0].run_id,
+            run_attempt: $gates[0].run_attempt,
+            gates: $gates[0].gates,
+            skipped: []
         },
         images: $images[0],
         workflow: {
