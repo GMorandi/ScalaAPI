@@ -1,5 +1,10 @@
 # ScalaAPI
 
+> **This superproject is retired.** The paired product — platform and gateway,
+> with the gateway's full history — now lives and releases from
+> [ScalaAPI-Platform](https://github.com/GMorandi/ScalaAPI-Platform). This
+> repository is archived; the final pinned pair below is the handover record.
+
 **English** | [简体中文](README.zh-CN.md)
 
 ScalaAPI is a production-grade LLM API platform: a high-performance C++ edge

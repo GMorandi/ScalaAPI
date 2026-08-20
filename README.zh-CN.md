@@ -1,5 +1,9 @@
 # ScalaAPI
 
+> **本超项目已退役。** 配对产品——platform 与 gateway(含 gateway 完整历史)——
+> 现于 [ScalaAPI-Platform](https://github.com/GMorandi/ScalaAPI-Platform) 仓库内
+> 开发与发布。本仓库将归档;下方最终 pin 对为交接记录。
+
 [English](README.md) | **简体中文**
 
 ScalaAPI 是一个生产级 LLM API 平台:C++ 高性能边缘网关 + .NET 业务/资金权威,
